@@ -21,22 +21,19 @@ typedef struct mf_struct {
   pthread_t threads[MAX_THREADS];
   int blocked[MAX_THREADS];
   ucontext_t contexts[MAX_THREADS];
-  sem_t sem;
-} mf_struct;
-
-
-typedef struct mf_memlayout {
-  int num_threads;
+  sem_t sem[MAX_THREADS];
   void *stack_addr[MAX_THREADS];
   size_t  stack_sz[MAX_THREADS];
   pthread_attr_t attr[MAX_THREADS];
-} mf_memlayout;
+} mf_struct;
 
-pid_t multifork(mf_struct *mf_data);
-void store_thread(pthread_t t, mf_memlayout *mf_mem_layout, int i);
-void restore_thread(int i, mf_memlayout *mf_mem_layout, mf_struct *mf_data);
-int mf_init(mf_struct *mf_data);
-void mf_block(mf_struct *mf_data);
+pid_t multifork();
+void store_thread(pthread_t t, int i);
+void restore_thread(int i);
+mf_struct *mf_init();
+void mf_block();
+int mfthread_create(pthread_t *tid, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg);
+void* mf_thread_wrapper(void *);
 
 
 void *thread_entry(void *args);

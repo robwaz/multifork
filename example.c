@@ -3,43 +3,35 @@
 #include <unistd.h>
 
 
-mf_struct mf_data;
-
 void *sleep_loop(void *nope) {
 
-  sleep(3);
-  mf_block(&mf_data);
+  mf_block();
+  while (1) {
+    sleep(3);
 
-  printf("pthread %ld ending\n", pthread_self());
+    printf("pthread %0lx in pid %d looping\n", pthread_self(), getpid());
+  }
 
   return NULL;
 }
 
 int main() {
   pthread_t tid;
+  mf_init();
 
-  mf_init(&mf_data);
-  pthread_create(&tid, NULL, sleep_loop, NULL);
-  mf_data.num_threads = 1;
-  mf_data.threads[0] = tid;
+  mfthread_create(&tid, NULL, sleep_loop, NULL);
 
-  pid_t child_pid = multifork(&mf_data);
+  pid_t child_pid = multifork();
+
 
   if (!child_pid) {
-    // child 
-
-    printf("example: %d is about to sleep\n", getpid());
-    sleep(60);
-    printf("example: %d returns from sleep\n", getpid());
+    pthread_join(tid, NULL);
   }
   else {
+    printf("Parent PID: %d\n", getpid());
+    printf("Child PID: %d\n", child_pid);
     waitpid(child_pid, NULL, 0);
+    pthread_join(tid, NULL);
     printf("example: child_pid %d done\n", child_pid);
   }
 }
-
-
-
-
-
-

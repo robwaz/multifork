@@ -1,11 +1,7 @@
 #include "multifork.h"
 #include <stdint.h>
-
-
-/*  This is our equivalent to 
- *
- *
- */
+#include <stdint.h>
+#include <sys/mman.h>
 
 uint64_t getsp( void )
 {
@@ -14,14 +10,50 @@ uint64_t getsp( void )
     return sp;
 }
 
-int mf_init(mf_struct *mf_data) {
-  sem_init(&mf_data->sem, 0, 1);
-  return 0;
+
+mf_struct *mf_data;
+
+mf_struct *mf_init() {
+  mf_data = mmap(NULL, sizeof(mf_struct), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_POPULATE, 0,  0);
+  mf_data->num_threads = 0;
+
+  // TODO: Don't init unused semaphores
+  for (int i = 0; i < MAX_THREADS; i++) {
+    sem_init(&mf_data->sem[i], 1, 0);
+  }
+  return mf_data;
 }
 
 
-void mf_block(mf_struct *mf_data) {
-  char myobvious[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaa";
+void* mf_thread_wrapper(void * args) {
+  sem_wait( *(sem_t **) args);
+  uint64_t* func = *(uint64_t**) (args + 8);
+  ((void (*)(void*))(func))(NULL);
+  pthread_exit(NULL);
+}
+
+int mfthread_create(pthread_t *tid, const pthread_attr_t *attr, void *(*start_routine) (void *), void *arg) {
+  sem_t sem;
+  sem_init(&sem, 0, 0);
+
+  // two pointers, this is dumb
+  void **wrapper_arg = malloc(16);
+
+  wrapper_arg[0] = &sem;
+  wrapper_arg[1] = start_routine;
+
+  mf_data->num_threads++;
+
+  // TODO: target func arguments
+  int ret = pthread_create(tid, attr, mf_thread_wrapper, wrapper_arg);
+  mf_data->threads[0] = *tid;
+
+  sem_post(&sem);
+  return ret;
+}
+
+
+void mf_block() {
   pthread_t this_ptid = pthread_self();
   int found = 0;
   int index = 0;
@@ -30,6 +62,8 @@ void mf_block(mf_struct *mf_data) {
     if (mf_data->threads[index]  == this_ptid) {
       mf_data->blocked[index] = 1;
       found = 1;
+      getcontext(&mf_data->contexts[index]);
+      sem_wait(&mf_data->sem[index]);
       break;
     }
   }
@@ -38,118 +72,88 @@ void mf_block(mf_struct *mf_data) {
     perror("TID not foundin mf_data!\n");
   }
 
-
-  //sem_wait(&mf_data->sem);
-  while(mf_data->blocked[index] == 1) {
-    struct timespec req;
-    req.tv_sec = 0;
-    req.tv_nsec = 2000;
-    nanosleep(&req, NULL);
-  }
 }
 
 
-pid_t multifork(mf_struct *mf_data) {
+pid_t multifork() {
   assert(mf_data->num_threads <= MAX_THREADS);
-
-
-  mf_memlayout mf_mem_layout;
-  mf_mem_layout.num_threads = mf_data->num_threads;
-
-
-  struct timespec req;
 
   for (int i = 0; i < mf_data->num_threads; i++) {
     // We must wait for thread to be blocked on us
     while(mf_data->blocked[i] == 0) {
-      req.tv_sec = 0;
-      req.tv_nsec = 2000;
-      nanosleep(&req, NULL);
+      sleep(1);
     }
-    store_thread(mf_data->threads[i], &mf_mem_layout, i);
+    store_thread(mf_data->threads[i], i);
   }
-
-
-  // Do our fork/clone whatever
-
 
   pid_t child_pid = fork();
 
   if (!child_pid) {
-    // child
-    sem_init(&mf_data->sem, 0, 1);
     for (int i = 0; i < mf_data->num_threads; i++) {
-      restore_thread(i, &mf_mem_layout, mf_data);
+      restore_thread(i);
     }
   }
   else {
-    // cleanup 
-    for (int i = 0; i < mf_mem_layout.num_threads; i++) {
-      pthread_attr_destroy(&mf_mem_layout.attr[i]);
-      mf_data->blocked[i] = 0;
+    for (int i = 0; i < mf_data->num_threads; i++) {
+      pthread_attr_destroy(&mf_data->attr[i]);
     }
   }
   return child_pid;
 } 
 
-void store_thread(pthread_t t, mf_memlayout *mf_mem_layout, int i) {
+void store_thread(pthread_t t, int i) {
   void *stackaddr;
   size_t stacksize; 
 
-  if (pthread_getattr_np(t, &mf_mem_layout->attr[i]) != 0) {
+  void *newstackaddr;
+
+  if (pthread_getattr_np(t, &mf_data->attr[i]) != 0) {
     perror("Failed to call pthread_getattr\n");
     exit(2);
   }
 
-  // Lets assume the thread stacks are unmodified, but unused
-  pthread_attr_getstack(&mf_mem_layout->attr[i],&stackaddr, &stacksize);
-  mf_mem_layout->stack_addr[i] = stackaddr;
-  mf_mem_layout->stack_sz[i] = stacksize;
+  // Get pthread stack and copy it before releasing
+  pthread_attr_getstack(&mf_data->attr[i], &stackaddr, &stacksize);
+
+  // Not mapped shared because it should be inherited via fork
+  newstackaddr = mmap(NULL, stacksize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE | MAP_STACK, 0, 0);
+  memcpy(newstackaddr, stackaddr, stacksize);
+
+  mf_data->stack_addr[i] = newstackaddr;
+  mf_data->stack_sz[i] = stacksize;
 }
 
 // Note: Overwrite mf_data
-void restore_thread(int i, mf_memlayout *mf_mem_layout, mf_struct *mf_data) {
-  void *ugly_ptr = mmap(NULL, sizeof(mf_memlayout) + sizeof(mf_struct) + sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-  memcpy(ugly_ptr, (void *) &i, sizeof(int));
-  memcpy(ugly_ptr + sizeof(int), (void *) mf_data, sizeof(mf_struct));
-  memcpy(ugly_ptr + sizeof(int) + sizeof(mf_struct), (void *) mf_mem_layout, sizeof(mf_memlayout));
-
-
-
+void restore_thread(int i) {
   void *stackaddr;
   size_t stacksize; 
-  pthread_attr_getstack(&mf_mem_layout->attr[i],&stackaddr, &stacksize);
-  mf_mem_layout->stack_addr[i] = stackaddr;
-  mf_mem_layout->stack_sz[i] = stacksize;
+  pthread_attr_getstack(&mf_data->attr[i], &stackaddr, &stacksize);
+  mf_data->stack_addr[i] = stackaddr;
+  mf_data->stack_sz[i] = stacksize;
 
-  printf("saved stack: %lx\n", mf_mem_layout->stack_addr[i]);
-  printf("saved stack sz: %ld\n", mf_mem_layout->stack_sz[i]);
-  printf("attr stack: %lx\n", stackaddr);
+#ifdef DEBUG
+  printf("saved stack: %p\n", mf_data->stack_addr[i]);
+  printf("saved stack sz: %ld\n", mf_data->stack_sz[i]);
+  printf("attr stack: %p\n", stackaddr);
   printf("attr stack sz: %ld\n", stacksize);
+#endif
 
-  mf_data->contexts[i].uc_stack.ss_sp = mf_mem_layout->stack_addr[i];
-  mf_data->contexts[i].uc_stack.ss_size = mf_mem_layout->stack_sz[i];
+  mf_data->contexts[i].uc_stack.ss_sp = mf_data->stack_addr[i];
+  mf_data->contexts[i].uc_stack.ss_size = mf_data->stack_sz[i];
 
-  pthread_create(&mf_data->threads[i], &mf_mem_layout->attr[i], thread_entry, ugly_ptr);
+  pthread_create(&mf_data->threads[i], &mf_data->attr[i], thread_entry, (void *) &i);
 
-  sleep(1);
   mf_data->blocked[i] = 0;
+  sem_post(&mf_data->sem[i]);
 }
 
 void *thread_entry(void *args) {
-  // let's just pivot right over where we were
-  __asm__(
-      "push r10;"
-      "mov r10, rsp;"
-      "mov rbp, rsp;"
-      "sub rbp, 0x18;"
-      "sub r10, 0x80;"
-      "mov r10, [r10];"
-      "mov [rsp + 0x10], r10;"
-      "pop r10;"
-      "mov [rsp], rbp;"
-  );
+  // TODO: fix the FUGLY 
+  int index = *(int *)(args);
+  sem_post(&mf_data->sem[index]);
+  setcontext(&mf_data->contexts[index]);
 
+  // setcontext does not return
   return NULL;
 }
 
